@@ -58,6 +58,14 @@ public class MAllocationHdr extends X_C_AllocationHdr implements DocAction
 	private static final long serialVersionUID = -7787519874581251920L;
 
 	/**
+	 * PO attribute (see {@link PO#set_Attribute(String, Object)}): Integer C_Payment_ID of the payment whose
+	 * completion created this allocation. That payment is not yet Completed in the database when
+	 * {@link #completeIt()} recalculates the business partner open balance, so the calculation is told to
+	 * include it. Set by MPayment.allocateIt().
+	 */
+	public static final String ALLOCATION_IN_FLIGHT_PAYMENT_ID = "Allocation.InFlightPayment_ID";
+
+	/**
 	 * 	Get Allocations of Payment
 	 *	@param ctx context
 	 *	@param C_Payment_ID payment
@@ -955,12 +963,17 @@ public class MAllocationHdr extends X_C_AllocationHdr implements DocAction
 	{
 		List<Integer> bps = new ArrayList<Integer>();
 		getLines(false);
+		//	payment being completed that created this allocation - not yet Completed in the database
+		int inFlightC_Payment_ID = 0;
+		Object attribute = get_Attribute(ALLOCATION_IN_FLIGHT_PAYMENT_ID);
+		if (attribute != null && attribute instanceof Integer)
+			inFlightC_Payment_ID = ((Integer) attribute).intValue();
 		for (MAllocationLine line : m_lines) {
 			int C_BPartner_ID = line.getC_BPartner_ID();
 			if (! bps.contains(C_BPartner_ID)) {
 				bps.add(C_BPartner_ID);
 				MBPartner bpartner = new MBPartner(Env.getCtx(), C_BPartner_ID, get_TrxName());
-				bpartner.setTotalOpenBalance();
+				bpartner.setTotalOpenBalanceUsingCurrentDocument(Env.ZERO, inFlightC_Payment_ID);
 				bpartner.saveEx();
 			}
 		} // for all lines

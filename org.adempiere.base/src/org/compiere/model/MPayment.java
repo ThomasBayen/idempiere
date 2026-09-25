@@ -2372,6 +2372,8 @@ public class MPayment extends X_C_Payment
 		}
 		//do not post immediate alloc, alloc should post after payment
 		alloc.set_Attribute(DocumentEngine.DOCUMENT_POST_IMMEDIATE_AFTER_COMPLETE, Boolean.FALSE);
+		//this payment is not yet completed in the database, the BP open balance must still include it
+		alloc.set_Attribute(MAllocationHdr.ALLOCATION_IN_FLIGHT_PAYMENT_ID, Integer.valueOf(getC_Payment_ID()));
 		// added AdempiereException by zuhri
 		if (!alloc.processIt(DocAction.ACTION_Complete))
 			throw new AdempiereException(Msg.getMsg(getCtx(), "FailedProcessingDocument") + " - " + alloc.getProcessMsg());
@@ -2414,6 +2416,8 @@ public class MPayment extends X_C_Payment
 		aLine.saveEx(get_TrxName());
 		//do not post immediate alloc
 		alloc.set_Attribute(DocumentEngine.DOCUMENT_POST_IMMEDIATE_AFTER_COMPLETE, Boolean.FALSE);
+		//this payment is not yet completed in the database, the BP open balance must still include it
+		alloc.set_Attribute(MAllocationHdr.ALLOCATION_IN_FLIGHT_PAYMENT_ID, Integer.valueOf(getC_Payment_ID()));
 		// added AdempiereException by zuhri
 		if (!alloc.processIt(DocAction.ACTION_Complete))
 			throw new AdempiereException(Msg.getMsg(getCtx(), "FailedProcessingDocument") + " - " + alloc.getProcessMsg());
@@ -2513,6 +2517,8 @@ public class MPayment extends X_C_Payment
 		{
 			//do not post immediate alloc
 			alloc.set_Attribute(DocumentEngine.DOCUMENT_POST_IMMEDIATE_AFTER_COMPLETE, Boolean.FALSE);
+			//this payment is not yet completed in the database, the BP open balance must still include it
+			alloc.set_Attribute(MAllocationHdr.ALLOCATION_IN_FLIGHT_PAYMENT_ID, Integer.valueOf(getC_Payment_ID()));
 			// added Adempiere Exception by zuhri
 			if (alloc.processIt(DocAction.ACTION_Complete)) {
 				addDocsPostProcess(alloc);

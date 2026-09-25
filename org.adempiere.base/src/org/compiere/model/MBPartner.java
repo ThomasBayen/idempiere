@@ -718,6 +718,19 @@ public class MBPartner extends X_C_BPartner implements ImmutablePOSupport
 	 */
 	public void setTotalOpenBalanceUsingCurrentDocument (BigDecimal amtToSubtractInBaseCurrency)
 	{
+		setTotalOpenBalanceUsingCurrentDocument(amtToSubtractInBaseCurrency, 0);
+	}
+
+	/**
+	 * 	Calculate Total Open Balance and SO_CreditUsed.
+	 * @param amtToSubtractInBaseCurrency : amount
+	 * @param inFlightC_Payment_ID : payment that is currently being completed (0 = none).
+	 * 	Its DocStatus is not yet Completed in the database (DocumentEngine persists the new status
+	 * 	after completeIt() returns), but the allocation created by its completion updates the
+	 * 	business partner balance now, so the unallocated remainder of this payment must already be counted.
+	 */
+	public void setTotalOpenBalanceUsingCurrentDocument (BigDecimal amtToSubtractInBaseCurrency, int inFlightC_Payment_ID)
+	{
 		log.info("");
 		BigDecimal SO_CreditUsed = null;
 		BigDecimal TotalOpenBalance = null;
@@ -731,7 +744,9 @@ public class MBPartner extends X_C_BPartner implements ImmutablePOSupport
 				+ "WHERE i.C_BPartner_ID=bp.C_BPartner_ID AND i.IsPaid='N' AND i.DocStatus IN ('CO','CL')),0) - "
 			+ "COALESCE((SELECT SUM(currencyBase(Paymentavailable(p.C_Payment_ID),p.C_Currency_ID,p.DateTrx,p.AD_Client_ID,p.AD_Org_ID)) FROM C_Payment_v p "
 				+ "WHERE p.C_BPartner_ID=bp.C_BPartner_ID AND p.IsAllocated='N'"
-				+ " AND p.C_Charge_ID IS NULL AND p.DocStatus IN ('CO','CL')),0) "
+				+ " AND p.C_Charge_ID IS NULL AND "
+				+ (inFlightC_Payment_ID > 0 ? "(p.DocStatus IN ('CO','CL') OR p.C_Payment_ID=?)" : "p.DocStatus IN ('CO','CL')")
+				+ "),0) "
 			+ "FROM C_BPartner bp "
 			+ "WHERE C_BPartner_ID=?";		
 		PreparedStatement pstmt = null;
@@ -739,7 +754,10 @@ public class MBPartner extends X_C_BPartner implements ImmutablePOSupport
 		try
 		{
 			pstmt = DB.prepareStatement (sql, get_TrxName());
-			pstmt.setInt (1, getC_BPartner_ID());
+			int idx = 1;
+			if (inFlightC_Payment_ID > 0)
+				pstmt.setInt (idx++, inFlightC_Payment_ID);
+			pstmt.setInt (idx, getC_BPartner_ID());
 			rs = pstmt.executeQuery ();
 			if (rs.next ())
 			{

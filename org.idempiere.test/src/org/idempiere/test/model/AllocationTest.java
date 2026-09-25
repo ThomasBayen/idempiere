@@ -51,6 +51,7 @@ import org.compiere.model.MFactAcct;
 import org.compiere.model.MInvoice;
 import org.compiere.model.MInvoiceLine;
 import org.compiere.model.MPayment;
+import org.compiere.model.MPaymentAllocate;
 import org.compiere.model.PO;
 import org.compiere.model.Query;
 import org.compiere.process.DocAction;
@@ -312,6 +313,561 @@ public class AllocationTest extends AbstractTestCase {
 			assertEquals(severeCount, errorLogs.length, "Severe errors recorded in log: " + errorLogs.length);
 
 		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Receipt with over-payment (PayAmt 105 for a 100 invoice, OverUnderAmt -5): the automatic
+	 * allocation is completed while the payment is still Drafted in the database, nevertheless the
+	 * unallocated remainder (5) must reduce the business partner open balance.
+	 */
+	@Test
+	public void testAllocateCustomerInvoiceOverPayment() {
+		int severeCount = 0;
+		LogRecord[] errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			severeCount = errorLogs.length;
+
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+		assertOpenBalance(bpartner, initialBalance.add(Env.ONEHUNDRED), "after invoice");
+		assertCreditUsed(bpartner, initialCreditUsed.add(Env.ONEHUNDRED), "after invoice");
+
+		// Pay $105 - over-payment of $5
+		BigDecimal overPayment = new BigDecimal("5");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), true, Env.ONEHUNDRED.add(overPayment), invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(overPayment.negate());
+		payment.saveEx();
+		completeDocument(payment);
+
+		assertFalse(payment.isAllocated(), "Over-paid payment must not be fully allocated");
+		assertTrue(Env.ONEHUNDRED.compareTo(payment.getAllocatedAmt()) == 0, "Allocated amount not as expected: " + payment.getAllocatedAmt());
+		invoice.load(trxName);
+		assertTrue(invoice.isPaid(), "Invoice is not paid");
+
+		// the invoice is paid, the remainder of the payment is an open credit of the customer
+		assertOpenBalance(bpartner, initialBalance.subtract(overPayment), "after over-payment");
+		// credit used follows the invoice only, never the remainder of a payment
+		assertCreditUsed(bpartner, initialCreditUsed, "after over-payment");
+
+		errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			assertEquals(severeCount, errorLogs.length, "Severe errors recorded in log: " + errorLogs.length);
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * AP mirror of {@link #testAllocateCustomerInvoiceOverPayment()}: vendor invoice 100, payment 105,
+	 * the vendor now owes us 5, so the open balance must increase by 5.
+	 */
+	@Test
+	public void testAllocateVendorInvoiceOverPayment() {
+		int severeCount = 0;
+		LogRecord[] errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			severeCount = errorLogs.length;
+
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.TREE_FARM.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.TREE_FARM.id, false, Env.ONEHUNDRED);
+		assertOpenBalance(bpartner, initialBalance.subtract(Env.ONEHUNDRED), "after vendor invoice");
+
+		BigDecimal overPayment = new BigDecimal("5");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), false, Env.ONEHUNDRED.add(overPayment), invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(overPayment.negate());
+		payment.saveEx();
+		completeDocument(payment);
+
+		assertFalse(payment.isAllocated(), "Over-paid payment must not be fully allocated");
+		assertTrue(Env.ONEHUNDRED.compareTo(payment.getAllocatedAmt().abs()) == 0, "Allocated amount not as expected: " + payment.getAllocatedAmt());
+		invoice.load(trxName);
+		assertTrue(invoice.isPaid(), "Invoice is not paid");
+
+		assertOpenBalance(bpartner, initialBalance.add(overPayment), "after over-payment");
+		// no sales document involved
+		assertCreditUsed(bpartner, initialCreditUsed, "after over-payment");
+
+		errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			assertEquals(severeCount, errorLogs.length, "Severe errors recorded in log: " + errorLogs.length);
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Same over-payment through C_PaymentAllocate (payment without invoice reference, one
+	 * allocate line with InvoiceAmt 100, Amount 105, OverUnderAmt -5).
+	 */
+	@Test
+	public void testPaymentAllocateOverPayment() {
+		int severeCount = 0;
+		LogRecord[] errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			severeCount = errorLogs.length;
+
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+		assertOpenBalance(bpartner, initialBalance.add(Env.ONEHUNDRED), "after invoice");
+
+		BigDecimal overPayment = new BigDecimal("5");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), true, Env.ONEHUNDRED.add(overPayment), invoice.getDateInvoiced());
+		payment.saveEx();
+
+		MPaymentAllocate pa = new MPaymentAllocate(ctx, 0, trxName);
+		pa.setC_Payment_ID(payment.getC_Payment_ID());
+		pa.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		pa.setInvoiceAmt(Env.ONEHUNDRED);
+		pa.setAmount(Env.ONEHUNDRED.add(overPayment));
+		pa.setOverUnderAmt(overPayment.negate());
+		pa.saveEx();
+
+		completeDocument(payment);
+
+		assertFalse(payment.isAllocated(), "Over-paid payment must not be fully allocated");
+		assertTrue(Env.ONEHUNDRED.compareTo(payment.getAllocatedAmt()) == 0, "Allocated amount not as expected: " + payment.getAllocatedAmt());
+		invoice.load(trxName);
+		assertTrue(invoice.isPaid(), "Invoice is not paid");
+
+		assertOpenBalance(bpartner, initialBalance.subtract(overPayment), "after over-payment");
+		assertCreditUsed(bpartner, initialCreditUsed, "after over-payment");
+
+		errorLogs = CLogErrorBuffer.get(true).getRecords(true);
+		if (errorLogs != null)
+			assertEquals(severeCount, errorLogs.length, "Severe errors recorded in log: " + errorLogs.length);
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * The recalculation itself: a drafted payment is not counted (unchanged behaviour), unless it is
+	 * passed as the payment currently being completed; a foreign id changes nothing.
+	 */
+	@Test
+	public void testOpenBalanceCountsInFlightPaymentOnly() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		bpartner.setTotalOpenBalance();
+		BigDecimal baseline = bpartner.getTotalOpenBalance();
+		BigDecimal baselineCreditUsed = bpartner.getSO_CreditUsed();
+
+		BigDecimal payAmt = new BigDecimal("50");
+		MPayment payment = createPaymentDraft(bpartner.getC_BPartner_ID(), true, payAmt, TimeUtil.getDay(System.currentTimeMillis()));
+		payment.saveEx(); // stays Drafted
+
+		bpartner.setTotalOpenBalance();
+		assertTrue(bpartner.getTotalOpenBalance().compareTo(baseline) == 0,
+				"Drafted payment must not be counted: " + bpartner.getTotalOpenBalance().toPlainString());
+
+		bpartner.setTotalOpenBalanceUsingCurrentDocument(Env.ZERO, payment.getC_Payment_ID());
+		assertTrue(bpartner.getTotalOpenBalance().compareTo(baseline.subtract(payAmt)) == 0,
+				"Payment being completed must be counted: " + bpartner.getTotalOpenBalance().toPlainString());
+		assertTrue(bpartner.getSO_CreditUsed().compareTo(baselineCreditUsed) == 0,
+				"A payment must not change SO_CreditUsed: " + bpartner.getSO_CreditUsed().toPlainString());
+
+		bpartner.setTotalOpenBalanceUsingCurrentDocument(Env.ZERO, Integer.MAX_VALUE);
+		assertTrue(bpartner.getTotalOpenBalance().compareTo(baseline) == 0,
+				"Unknown payment id must change nothing: " + bpartner.getTotalOpenBalance().toPlainString());
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Under-payment (PayAmt 60 for a 100 invoice, OverUnderAmt +40): fully allocated, invoice stays open with 40.
+	 */
+	@Test
+	public void testAllocateCustomerInvoiceUnderPayment() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+
+		BigDecimal payAmt = new BigDecimal("60");
+		BigDecimal remaining = new BigDecimal("40");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), true, payAmt, invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(remaining);
+		payment.saveEx();
+		completeDocument(payment);
+
+		assertTrue(payment.isAllocated(), "Under-paid payment must be fully allocated");
+		invoice.load(trxName);
+		assertFalse(invoice.isPaid(), "Invoice must not be paid");
+		assertTrue(remaining.compareTo(invoice.getOpenAmt()) == 0, "Invoice open amount not as expected: " + invoice.getOpenAmt());
+
+		assertOpenBalance(bpartner, initialBalance.add(remaining), "after under-payment");
+		assertCreditUsed(bpartner, initialCreditUsed.add(remaining), "after under-payment");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * AP mirror of {@link #testAllocateCustomerInvoiceUnderPayment()}: we still owe 40.
+	 */
+	@Test
+	public void testAllocateVendorInvoiceUnderPayment() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.TREE_FARM.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.TREE_FARM.id, false, Env.ONEHUNDRED);
+
+		BigDecimal payAmt = new BigDecimal("60");
+		BigDecimal remaining = new BigDecimal("40");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), false, payAmt, invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(remaining);
+		payment.saveEx();
+		completeDocument(payment);
+
+		assertTrue(payment.isAllocated(), "Under-paid payment must be fully allocated");
+		invoice.load(trxName);
+		assertFalse(invoice.isPaid(), "Invoice must not be paid");
+
+		assertOpenBalance(bpartner, initialBalance.subtract(remaining), "after under-payment");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Payment 95 with discount 3 and write-off 2 settles a 100 invoice completely.
+	 */
+	@Test
+	public void testAllocateCustomerInvoiceWithDiscountAndWriteOff() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), true, new BigDecimal("95"), invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setDiscountAmt(new BigDecimal("3"));
+		payment.setWriteOffAmt(new BigDecimal("2"));
+		payment.saveEx();
+		completeDocument(payment);
+
+		assertTrue(payment.isAllocated(), "Payment must be fully allocated");
+		invoice.load(trxName);
+		assertTrue(invoice.isPaid(), "Invoice is not paid");
+
+		assertOpenBalance(bpartner, initialBalance, "after payment with discount and write-off");
+		assertCreditUsed(bpartner, initialCreditUsed, "after payment with discount and write-off");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * C_PaymentAllocate without remainder: one payment of 100 settles two invoices of 60 and 40.
+	 */
+	@Test
+	public void testPaymentAllocateTwoInvoicesExact() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		BigDecimal amount1 = new BigDecimal("60");
+		BigDecimal amount2 = new BigDecimal("40");
+		MInvoice invoice1 = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, amount1);
+		MInvoice invoice2 = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, amount2);
+		assertOpenBalance(bpartner, initialBalance.add(Env.ONEHUNDRED), "after two invoices");
+
+		MPayment payment = createPaymentDraft(invoice1.getC_BPartner_ID(), true, Env.ONEHUNDRED, invoice1.getDateInvoiced());
+		payment.saveEx();
+
+		MPaymentAllocate pa1 = new MPaymentAllocate(ctx, 0, trxName);
+		pa1.setC_Payment_ID(payment.getC_Payment_ID());
+		pa1.setC_Invoice_ID(invoice1.getC_Invoice_ID());
+		pa1.setInvoiceAmt(amount1);
+		pa1.setAmount(amount1);
+		pa1.saveEx();
+
+		MPaymentAllocate pa2 = new MPaymentAllocate(ctx, 0, trxName);
+		pa2.setC_Payment_ID(payment.getC_Payment_ID());
+		pa2.setC_Invoice_ID(invoice2.getC_Invoice_ID());
+		pa2.setInvoiceAmt(amount2);
+		pa2.setAmount(amount2);
+		pa2.saveEx();
+
+		completeDocument(payment);
+
+		assertTrue(payment.isAllocated(), "Payment must be fully allocated");
+		invoice1.load(trxName);
+		invoice2.load(trxName);
+		assertTrue(invoice1.isPaid(), "Invoice 1 is not paid");
+		assertTrue(invoice2.isPaid(), "Invoice 2 is not paid");
+
+		assertOpenBalance(bpartner, initialBalance, "after payment");
+		assertCreditUsed(bpartner, initialCreditUsed, "after payment");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Prepayment 50, then invoice 100, then a manual allocation of the prepayment: the allocation
+	 * must not change the open balance (it only moves value from the payment to the invoice).
+	 */
+	@Test
+	public void testPrepaymentThenInvoiceThenAllocation() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		BigDecimal prepayment = new BigDecimal("50");
+		MPayment payment = createPaymentDraft(bpartner.getC_BPartner_ID(), true, prepayment, TimeUtil.getDay(System.currentTimeMillis()));
+		payment.saveEx();
+		completeDocument(payment);
+		assertFalse(payment.isAllocated(), "Prepayment must not be allocated");
+		assertOpenBalance(bpartner, initialBalance.subtract(prepayment), "after prepayment");
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+		assertOpenBalance(bpartner, initialBalance.add(prepayment), "after invoice");
+		assertCreditUsed(bpartner, initialCreditUsed.add(Env.ONEHUNDRED), "after invoice");
+
+		createManualAllocation(payment, invoice, prepayment);
+
+		payment.load(trxName);
+		assertTrue(payment.isAllocated(), "Prepayment must be allocated now");
+		invoice.load(trxName);
+		assertFalse(invoice.isPaid(), "Invoice must still be open");
+		assertTrue(prepayment.compareTo(invoice.getOpenAmt()) == 0, "Invoice open amount not as expected: " + invoice.getOpenAmt());
+
+		// the allocation moved 50 from the payment to the invoice, the balance stays
+		assertOpenBalance(bpartner, initialBalance.add(prepayment), "after allocation");
+		assertCreditUsed(bpartner, initialCreditUsed.add(prepayment), "after allocation");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * The remainder of an over-payment is later allocated to a second invoice: the value computed
+	 * while the payment was being completed must match the value after the later allocation.
+	 */
+	@Test
+	public void testOverPaymentRemainderAllocatedLater() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice1 = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+
+		BigDecimal overPayment = new BigDecimal("5");
+		MPayment payment = createPaymentDraft(invoice1.getC_BPartner_ID(), true, Env.ONEHUNDRED.add(overPayment), invoice1.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice1.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(overPayment.negate());
+		payment.saveEx();
+		completeDocument(payment);
+		assertOpenBalance(bpartner, initialBalance.subtract(overPayment), "after over-payment");
+
+		MInvoice invoice2 = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, overPayment);
+		assertOpenBalance(bpartner, initialBalance, "after second invoice");
+
+		createManualAllocation(payment, invoice2, overPayment);
+
+		payment.load(trxName);
+		assertTrue(payment.isAllocated(), "Payment must be fully allocated now");
+		invoice2.load(trxName);
+		assertTrue(invoice2.isPaid(), "Second invoice is not paid");
+
+		assertOpenBalance(bpartner, initialBalance, "after allocating the remainder");
+		assertCreditUsed(bpartner, initialCreditUsed, "after allocating the remainder");
+
+		rollback();
+	}
+
+	/**
+	 * https://idempiere.atlassian.net/browse/IDEMPIERE-7124
+	 * Reverse-correct of an over-paid payment restores the invoice and the open balance.
+	 */
+	@Test
+	public void testOverPaymentReverseCorrect() {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MBPartner bpartner = new MBPartner(ctx, DictionaryIDs.C_BPartner.PATIO.id, trxName);
+		DB.getDatabase().forUpdate(bpartner, 0);
+		BigDecimal initialBalance = bpartner.getTotalOpenBalance();
+		BigDecimal initialCreditUsed = bpartner.getSO_CreditUsed();
+
+		MInvoice invoice = createChargeInvoice(DictionaryIDs.C_BPartner.PATIO.id, true, Env.ONEHUNDRED);
+
+		BigDecimal overPayment = new BigDecimal("5");
+		MPayment payment = createPaymentDraft(invoice.getC_BPartner_ID(), true, Env.ONEHUNDRED.add(overPayment), invoice.getDateInvoiced());
+		payment.setC_Invoice_ID(invoice.getC_Invoice_ID());
+		payment.setIsOverUnderPayment(true);
+		payment.setOverUnderAmt(overPayment.negate());
+		payment.saveEx();
+		completeDocument(payment);
+		assertOpenBalance(bpartner, initialBalance.subtract(overPayment), "after over-payment");
+
+		reverseCorrectDocument(payment);
+
+		invoice.load(trxName);
+		assertFalse(invoice.isPaid(), "Invoice must be open again");
+		assertTrue(Env.ONEHUNDRED.compareTo(invoice.getOpenAmt()) == 0, "Invoice open amount not as expected: " + invoice.getOpenAmt());
+
+		assertOpenBalance(bpartner, initialBalance.add(Env.ONEHUNDRED), "after reversal");
+		assertCreditUsed(bpartner, initialCreditUsed.add(Env.ONEHUNDRED), "after reversal");
+
+		rollback();
+	}
+
+	/**
+	 * Completed AR or AP invoice with one charge line (no tax) for the given amount.
+	 */
+	private MInvoice createChargeInvoice(int C_BPartner_ID, boolean isAR, BigDecimal amount) {
+		Properties ctx = Env.getCtx();
+		String trxName = getTrxName();
+
+		MInvoice invoice = new MInvoice(ctx, 0, trxName);
+		invoice.setBPartner(MBPartner.get(ctx, C_BPartner_ID));
+		invoice.setC_DocTypeTarget_ID(isAR ? MDocType.DOCBASETYPE_ARInvoice : MDocType.DOCBASETYPE_APInvoice);
+		invoice.setC_DocType_ID(invoice.getC_DocTypeTarget_ID()); // required to avoid runDocumentActionWorkflow exception
+		invoice.setPaymentRule(MInvoice.PAYMENTRULE_Check);
+		invoice.setC_PaymentTerm_ID(DictionaryIDs.C_PaymentTerm.IMMEDIATE.id);
+		Timestamp today = TimeUtil.getDay(System.currentTimeMillis());
+		invoice.setDateInvoiced(today);
+		invoice.setDateAcct(today);
+		invoice.setDocStatus(DocAction.STATUS_Drafted);
+		invoice.setDocAction(DocAction.ACTION_Complete);
+		invoice.saveEx();
+
+		MInvoiceLine line1 = new MInvoiceLine(invoice);
+		line1.setLine(10);
+		line1.setC_Charge_ID(DictionaryIDs.C_Charge.FREIGHT.id);
+		line1.setQty(new BigDecimal("1"));
+		line1.setPrice(amount);
+		line1.saveEx();
+
+		completeDocument(invoice);
+		return invoice;
+	}
+
+	/**
+	 * Receipt or AP payment for the business partner, not yet saved - the caller sets invoice,
+	 * over/under payment, discount or write-off, saves and completes it.
+	 */
+	private MPayment createPaymentDraft(int C_BPartner_ID, boolean isReceipt, BigDecimal payAmt, Timestamp date) {
+		MPayment payment = new MPayment(Env.getCtx(), 0, getTrxName());
+		payment.setC_BPartner_ID(C_BPartner_ID);
+		payment.setC_DocType_ID(isReceipt);
+		payment.setDocStatus(DocAction.STATUS_Drafted);
+		payment.setDocAction(DocAction.ACTION_Complete);
+		payment.setPayAmt(payAmt);
+		payment.setTenderType(MPayment.TENDERTYPE_Check);
+		payment.setC_BankAccount_ID(DictionaryIDs.C_BankAccount.ACCOUNT_1234.id);
+		payment.setC_Currency_ID(DictionaryIDs.C_Currency.USD.id);
+		payment.setDateTrx(date);
+		payment.setDateAcct(date);
+		return payment;
+	}
+
+	/**
+	 * Manual allocation of a payment to an invoice, completed.
+	 */
+	private MAllocationHdr createManualAllocation(MPayment payment, MInvoice invoice, BigDecimal amount) {
+		Properties ctx = Env.getCtx();
+		MAllocationHdr alloc = new MAllocationHdr(ctx, true, payment.getDateTrx(), payment.getC_Currency_ID(),
+				Env.getContext(ctx, "#AD_User_Name"), getTrxName());
+		alloc.setAD_Org_ID(payment.getAD_Org_ID());
+		alloc.setC_DocType_ID(MDocType.getDocType(MDocType.DOCBASETYPE_PaymentAllocation));
+		alloc.saveEx();
+
+		MAllocationLine aLine = new MAllocationLine(alloc, amount, Env.ZERO, Env.ZERO, Env.ZERO);
+		aLine.setDocInfo(invoice.getC_BPartner_ID(), 0, invoice.getC_Invoice_ID());
+		aLine.setPaymentInfo(payment.getC_Payment_ID(), 0);
+		aLine.saveEx();
+
+		completeDocument(alloc);
+		return alloc;
+	}
+
+	/**
+	 * The stored open balance must equal the expected value, and so must a full recalculation.
+	 */
+	private void assertOpenBalance(MBPartner bpartner, BigDecimal expected, String step) {
+		bpartner.load(getTrxName());
+		BigDecimal actual = bpartner.getTotalOpenBalance();
+		assertTrue(actual.compareTo(expected) == 0,
+				step + ": open balance expected " + expected.toPlainString() + " but was " + actual.toPlainString());
+
+		MBPartner recalculated = new MBPartner(Env.getCtx(), bpartner.getC_BPartner_ID(), getTrxName());
+		recalculated.setTotalOpenBalance();
+		assertTrue(recalculated.getTotalOpenBalance().compareTo(expected) == 0,
+				step + ": recalculated open balance expected " + expected.toPlainString() + " but was " + recalculated.getTotalOpenBalance().toPlainString());
+	}
+
+	/**
+	 * SO_CreditUsed follows open sales invoices only, never the remainder of a payment.
+	 */
+	private void assertCreditUsed(MBPartner bpartner, BigDecimal expected, String step) {
+		bpartner.load(getTrxName());
+		BigDecimal actual = bpartner.getSO_CreditUsed();
+		assertTrue(actual.compareTo(expected) == 0,
+				step + ": SO_CreditUsed expected " + expected.toPlainString() + " but was " + actual.toPlainString());
 	}
 
 	@Test
